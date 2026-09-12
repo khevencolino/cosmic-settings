@@ -10,7 +10,7 @@ use cosmic::iced::core::text::{Ellipsize, EllipsizeHeightLimit};
 use cosmic::iced::widget::scrollable::RelativeOffset;
 use cosmic::iced::{Alignment, Length, stream, time};
 use cosmic::widget::{
-    self, column, container, dropdown, list_column, segmented_button, tab_bar, text,
+    self, column, container, dropdown, list_column, segmented_button, slider, tab_bar, text,
 };
 use cosmic::{Apply, Element, Task, surface};
 use cosmic_randr_shell::{
@@ -22,9 +22,32 @@ use indexmap::Equivalent;
 use slotmap::{Key, SecondaryMap, SlotMap};
 use std::collections::BTreeMap;
 use std::process::ExitStatus;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use tokio::sync::oneshot;
+
+#[zbus::proxy(
+    default_service = "com.system76.CosmicSettingsDaemon",
+    interface = "com.system76.CosmicSettingsDaemon",
+    default_path = "/com/system76/CosmicSettingsDaemon"
+)]
+trait CosmicSettingsDaemon {
+    fn display_brightness_for_output(
+        &self,
+        output_name: &str,
+        make: &str,
+        model: &str,
+        serial: &str,
+    ) -> zbus::Result<i32>;
+    fn set_display_brightness_for_output(
+        &self,
+        output_name: &str,
+        make: &str,
+        model: &str,
+        serial: &str,
+        value: i32,
+    ) -> zbus::Result<()>;
+}
 
 static DPI_SCALES: &[u32] = &[50, 75, 100, 125, 150, 175, 200, 225, 250, 275, 300];
 
@@ -69,6 +92,10 @@ pub enum Message {
     Position(OutputKey, i32, i32),
     /// Changes the active display being configured.
     Display(segmented_button::Entity),
+    /// Set hardware brightness of a display.
+    HardwareBrightness(i32),
+    /// Connection to the settings daemon.
+    HardwareBrightnessConnection(zbus::Connection),
     /// Set the color depth of a display.
     ColorDepth(ColorDepth),
     /// Set the color profile of a display.
@@ -153,6 +180,9 @@ pub struct Page {
     dialog_countdown: usize,
     show_display_options: bool,
     adjusted_scale: u32,
+    brightness_connection: Option<zbus::Connection>,
+    hardware_brightness: Option<i32>,
+    brightness_request: Arc<AtomicU64>,
 }
 
 impl Default for Page {
@@ -175,6 +205,9 @@ impl Default for Page {
             dialog_countdown: 0,
             show_display_options: true,
             adjusted_scale: 0,
+            brightness_connection: None,
+            hardware_brightness: None,
+            brightness_request: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -246,8 +279,18 @@ impl page::Page<crate::pages::Message> for Page {
             fl!("orientation", "rotate-270"),
         ];
 
-        let mut tasks = Vec::with_capacity(3);
+        let mut tasks = Vec::with_capacity(4);
         tasks.push(cosmic::task::future(on_enter()));
+        tasks.push(cosmic::task::future(async {
+            let message = match zbus::Connection::session().await {
+                Ok(connection) => Message::HardwareBrightnessConnection(connection),
+                Err(err) => {
+                    tracing::debug!(?err, "settings daemon D-Bus connection unavailable");
+                    Message::DialogComplete
+                }
+            };
+            crate::pages::Message::Displays(message)
+        }));
 
         if let Some((canceller, handle)) = self.randr_handle.take() {
             _ = canceller.send(());
@@ -546,7 +589,20 @@ impl Page {
                 }
             }
 
-            Message::Display(display) => self.set_display(display),
+            Message::Display(display) => {
+                self.set_display(display);
+                return self.hardware_brightness_task();
+            }
+
+            Message::HardwareBrightnessConnection(connection) => {
+                self.brightness_connection = Some(connection);
+                return self.hardware_brightness_task();
+            }
+
+            Message::HardwareBrightness(value) => {
+                self.hardware_brightness = Some(value);
+                return self.set_hardware_brightness(value);
+            }
 
             Message::ColorDepth(color_depth) => return self.set_color_depth(color_depth),
 
@@ -644,6 +700,7 @@ impl Page {
                 match Arc::into_inner(randr) {
                     Some(Ok(outputs)) => {
                         self.update_displays(outputs);
+                        return self.hardware_brightness_task();
                     }
 
                     Some(Err(why)) => {
@@ -736,6 +793,57 @@ impl Page {
         cosmic::task::future(async {
             tokio::time::sleep(time::Duration::from_secs(1)).await;
             app::Message::from(Message::DialogCountdown)
+        })
+    }
+
+    fn hardware_brightness_task(&self) -> Task<app::Message> {
+        let Some(connection) = self.brightness_connection.clone() else {
+            return Task::none();
+        };
+        let Some(output) = self.list.outputs.get(self.active_display) else {
+            return Task::none();
+        };
+        let name = output.name.clone();
+        let make = output.make.clone().unwrap_or_default();
+        let model = output.model.clone();
+        let serial = output.serial_number.clone();
+        cosmic::task::future(async move {
+            let proxy = match CosmicSettingsDaemonProxy::new(&connection).await {
+                Ok(proxy) => proxy,
+                Err(_) => return app::Message::from(Message::HardwareBrightness(-1)),
+            };
+            let value = proxy
+                .display_brightness_for_output(&name, &make, &model, &serial)
+                .await
+                .unwrap_or(-1);
+            app::Message::from(Message::HardwareBrightness(value))
+        })
+    }
+
+    fn set_hardware_brightness(&self, value: i32) -> Task<app::Message> {
+        let Some(connection) = self.brightness_connection.clone() else {
+            return Task::none();
+        };
+        let request = self.brightness_request.fetch_add(1, Ordering::Relaxed) + 1;
+        let request_state = self.brightness_request.clone();
+        let Some(output) = self.list.outputs.get(self.active_display) else {
+            return Task::none();
+        };
+        let name = output.name.clone();
+        let make = output.make.clone().unwrap_or_default();
+        let model = output.model.clone();
+        let serial = output.serial_number.clone();
+        cosmic::task::future(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if request_state.load(Ordering::Relaxed) != request {
+                return app::Message::from(Message::DialogComplete);
+            }
+            if let Ok(proxy) = CosmicSettingsDaemonProxy::new(&connection).await {
+                let _ = proxy
+                    .set_display_brightness_for_output(&name, &make, &model, &serial, value)
+                    .await;
+            }
+            app::Message::from(Message::DialogComplete)
         })
     }
 
@@ -1245,6 +1353,7 @@ pub fn display_configuration() -> Section<crate::pages::Message> {
         scale = fl!("display", "scale");
         additional_scale_options = fl!("display", "additional-scale-options");
         orientation = fl!("orientation");
+        brightness = fl!("display", "brightness");
         enable_label = fl!("display", "enable");
         options_label = fl!("display", "options");
         mirroring_label = fl!("mirroring");
@@ -1262,7 +1371,15 @@ pub fn display_configuration() -> Section<crate::pages::Message> {
             let active_output = &page.list.outputs[active_id];
 
             let display_options = (page.show_display_options && active_output.enabled).then(|| {
-                let mut items = vec![
+                let mut items = Vec::new();
+                if let Some(value) = page.hardware_brightness.filter(|value| *value >= 0) {
+                    items.push(widget::settings::item(
+                        &descriptions[brightness],
+                        slider(1..=100, value.max(1), Message::HardwareBrightness)
+                            .width(Length::Fill),
+                    ));
+                }
+                items.extend([
                     widget::settings::item(
                         &descriptions[resolution],
                         dropdown::popup_dropdown(
@@ -1289,7 +1406,7 @@ pub fn display_configuration() -> Section<crate::pages::Message> {
                             },
                         ),
                     ),
-                ];
+                ]);
 
                 if let Some(vrr_selected) = page.cache.vrr_selected {
                     items.push(widget::settings::item(

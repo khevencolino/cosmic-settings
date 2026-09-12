@@ -419,7 +419,7 @@ style = Style
     .less = less
     .more = more
     .glass-opacity = Glass opacity
-    
+
 interface-density = Interface density
     .comfortable = Comfortable
     .compact = Compact
@@ -563,6 +563,7 @@ color = Color
 display = Displays
     .arrangement = Display arrangement
     .arrangement-desc = Drag displays to rearrange them
+    .brightness = Brightness
     .enable = Enable display
     .external = { $size } { $output } external display
     .laptop = { $size } laptop display
